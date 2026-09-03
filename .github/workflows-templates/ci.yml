@@ -195,6 +195,70 @@ jobs:
           path: .artifacts/quality-ratchet.md
           if-no-files-found: warn
 
+  quality-extended:
+    name: Quality Gates (Extended)
+    runs-on: ubuntu-latest
+    needs: changes
+    if: ${{ !contains(github.event.pull_request.labels.*.name, 'hotfix') && (github.event_name != 'pull_request' || (github.event.pull_request.draft == false && needs.changes.outputs.code == 'true')) }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - uses: actions/setup-node@v7
+        with:
+          node-version: ${{ env.CI_NODE_VERSION }}
+          cache: npm
+      - uses: ./.github/actions/npm-ci-with-retry
+      - name: Circular deps (dpdm; advisory)
+        continue-on-error: true
+        run: npm run check:circular-deps
+      - name: Bundle size (ratchet, blocking)
+        run: npm run check:bundle-size -- --ratchet
+      - name: Install advisory security scanners (gitleaks/osv/actionlint/zizmor)
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set +e
+          mkdir -p "$HOME/.local/bin"
+          # gitleaks — download latest linux x64 tarball via gh (authed), extract binary
+          rm -rf /tmp/gl && mkdir -p /tmp/gl
+          gh release download --repo gitleaks/gitleaks --pattern '*linux_x64.tar.gz' --dir /tmp/gl
+          tar -xzf /tmp/gl/*linux_x64.tar.gz -C "$HOME/.local/bin" gitleaks
+          # osv-scanner — download latest linux amd64 bare binary via gh (authed)
+          rm -rf /tmp/osv && mkdir -p /tmp/osv
+          gh release download --repo google/osv-scanner --pattern '*linux_amd64' --dir /tmp/osv
+          install -m 0755 /tmp/osv/*linux_amd64 "$HOME/.local/bin/osv-scanner"
+          # actionlint — official download script
+          bash <(curl -fsSL https://raw.githubusercontent.com/rhysd/actionlint/main/scripts/download-actionlint.bash) latest "$HOME/.local/bin"
+          # zizmor — PyPI (pipx preferred, pip --user fallback); lands in ~/.local/bin.
+          ZIZMOR_VERSION=1.25.2
+          pipx install "zizmor==$ZIZMOR_VERSION" || pip install --user "zizmor==$ZIZMOR_VERSION"
+          # oasdiff — download latest linux amd64 tarball via gh (authed), extract binary
+          rm -rf /tmp/oasd && mkdir -p /tmp/oasd
+          gh release download --repo oasdiff/oasdiff --pattern '*linux_amd64.tar.gz' --dir /tmp/oasd
+          tar -xzf /tmp/oasd/*linux_amd64.tar.gz -C "$HOME/.local/bin" oasdiff
+          # ALWAYS export the bin dir (even if any step above failed)
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          # diagnostics — prove what installed on the next CI run
+          ls -la "$HOME/.local/bin"
+          "$HOME/.local/bin/gitleaks" version || true
+          "$HOME/.local/bin/actionlint" -version || true
+          "$HOME/.local/bin/osv-scanner" --version || true
+          "$HOME/.local/bin/oasdiff" --version || true
+          zizmor --version || true
+      - name: Secret scan (gitleaks, ratchet, blocking)
+        run: npm run check:secrets -- --ratchet
+      - name: Vulnerability ratchet (osv-scanner, ratchet, blocking)
+        run: npm run check:vuln-ratchet -- --ratchet
+      - name: Workflow lint (actionlint+zizmor, ratchet, blocking)
+        run: npm run check:workflows -- --ratchet
+      - name: OpenAPI breaking-change (oasdiff, ratchet, blocking)
+        env:
+          BASE_REF: ${{ github.base_ref && format('origin/{0}', github.base_ref) || '' }}
+        run: npm run check:openapi-breaking -- --ratchet
+
   test-coverage:
     name: Coverage
     runs-on: ubuntu-latest
@@ -325,6 +389,7 @@ jobs:
       - changes
       - lint
       - quality-gate
+      - quality-extended
       - test-unit
       - test-coverage
     steps:
@@ -366,6 +431,7 @@ jobs:
           echo "| Change Classification | $(status '${{ needs.changes.result }}') |" >> "$GITHUB_STEP_SUMMARY"
           echo "| Lint | $(status '${{ needs.lint.result }}') |" >> "$GITHUB_STEP_SUMMARY"
           echo "| Quality Ratchet | $(status '${{ needs.quality-gate.result }}') |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Quality Extended | $(status '${{ needs.quality-extended.result }}') |" >> "$GITHUB_STEP_SUMMARY"
 
           echo "" >> "$GITHUB_STEP_SUMMARY"
           echo "## 🧪 Tests" >> "$GITHUB_STEP_SUMMARY"
